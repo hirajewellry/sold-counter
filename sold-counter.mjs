@@ -39,7 +39,7 @@ async function gql(query, variables = {}) {
 const ORDERS = `query($q:String!,$after:String){
   orders(first:15, after:$after, query:$q){
     pageInfo{hasNextPage endCursor}
-    nodes{ id cancelledAt test
+    nodes{ id createdAt cancelledAt test
       lineItems(first:20){ pageInfo{hasNextPage endCursor} nodes{ quantity product{ id } } }
     }
   }
@@ -50,7 +50,10 @@ const MORE = `query($id:ID!,$after:String){
 const PRODUCTS = `query($after:String){
   products(first:100, after:$after){
     pageInfo{hasNextPage endCursor}
-    nodes{ id metafield(namespace:"custom", key:"sold_7d"){ value } }
+    nodes{ id
+      m7: metafield(namespace:"custom", key:"sold_7d"){ value }
+      m6: metafield(namespace:"custom", key:"sold_6m"){ value }
+    }
   }
 }`;
 const SET = `mutation($m:[MetafieldsSetInput!]!){
@@ -59,34 +62,42 @@ const SET = `mutation($m:[MetafieldsSetInput!]!){
 
 await getToken();
 
-// 1) Count sold quantity per product (last 7 days, rolling)
-const since = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
-const sold = new Map();
-const add = (items) => {
+const DAY = 24 * 3600 * 1000;
+const since7 = Date.now() - 7 * DAY;
+const since6m = new Date(Date.now() - 182 * DAY).toISOString();
+const sold7 = new Map();
+const sold6 = new Map();
+
+const add = (items, isRecent) => {
   for (const li of items) {
-    if (li.product) sold.set(li.product.id, (sold.get(li.product.id) || 0) + li.quantity);
+    if (!li.product) continue;
+    const id = li.product.id;
+    sold6.set(id, (sold6.get(id) || 0) + li.quantity);
+    if (isRecent) sold7.set(id, (sold7.get(id) || 0) + li.quantity);
   }
 };
 
-let after = null, orderCount = 0;
+let after = null, orderCount = 0, oldest = null;
 do {
-  const d = await gql(ORDERS, { q: `created_at:>='${since}'`, after });
+  const d = await gql(ORDERS, { q: `created_at:>='${since6m}'`, after });
   for (const o of d.orders.nodes) {
     if (o.cancelledAt || o.test) continue;
     orderCount++;
-    add(o.lineItems.nodes);
+    if (!oldest || o.createdAt < oldest) oldest = o.createdAt;
+    const recent = new Date(o.createdAt).getTime() >= since7;
+    add(o.lineItems.nodes, recent);
     let p = o.lineItems.pageInfo;
     while (p.hasNextPage) {
       const m = await gql(MORE, { id: o.id, after: p.endCursor });
-      add(m.order.lineItems.nodes);
+      add(m.order.lineItems.nodes, recent);
       p = m.order.lineItems.pageInfo;
     }
   }
   after = d.orders.pageInfo.hasNextPage ? d.orders.pageInfo.endCursor : null;
 } while (after);
-console.log(`Orders counted: ${orderCount}, products with sales: ${sold.size}`);
+console.log(`Orders counted: ${orderCount}, products sold (6m): ${sold6.size}, (7d): ${sold7.size}`);
+console.log(`Oldest order read: ${oldest}`);
 
-// 2) Compare with current metafields (zero-sale products reset to 0)
 const changes = [];
 after = null;
 let total = 0;
@@ -94,25 +105,19 @@ do {
   const d = await gql(PRODUCTS, { after });
   for (const p of d.products.nodes) {
     total++;
-    const next = String(sold.get(p.id) || 0);
-    const current = p.metafield?.value ?? null;
-    if (current !== next) {
-      changes.push({
-        ownerId: p.id,
-        namespace: "custom",
-        key: "sold_7d",
-        type: "number_integer",
-        value: next,
-      });
-    }
+    const n7 = String(sold7.get(p.id) || 0);
+    const n6 = String(sold6.get(p.id) || 0);
+    if ((p.m7?.value ?? null) !== n7)
+      changes.push({ ownerId: p.id, namespace: "custom", key: "sold_7d", type: "number_integer", value: n7 });
+    if ((p.m6?.value ?? null) !== n6)
+      changes.push({ ownerId: p.id, namespace: "custom", key: "sold_6m", type: "number_integer", value: n6 });
   }
   after = d.products.pageInfo.hasNextPage ? d.products.pageInfo.endCursor : null;
 } while (after);
 
-// 3) Write in batches of 25
 for (let i = 0; i < changes.length; i += 25) {
   const d = await gql(SET, { m: changes.slice(i, i + 25) });
   const errs = d.metafieldsSet.userErrors;
   if (errs.length) throw new Error(JSON.stringify(errs));
 }
-console.log(`Products checked: ${total}, updated: ${changes.length}`);
+console.log(`Products checked: ${total}, values updated: ${changes.length}`);
